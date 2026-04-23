@@ -1,0 +1,81 @@
+# ─────────────────────────────────────────────
+#  Multimodal Misogyny Detection — Config
+# ─────────────────────────────────────────────
+
+# ── Paths ──────────────────────────────────────
+data:
+  # Google Drive folder mounted / downloaded to this root
+  root: "./dataset"
+  train_csv: "train.csv"
+  dev_csv:   "dev.csv"
+  images_dir: "images"          # subfolder inside root containing all images
+  image_ext:  ".jpg"            # extension to try; falls back to .png
+
+# ── Label columns in the CSV ───────────────────
+labels:
+  cultures: ["indian", "irish", "chinese"]
+  csv_columns:
+    indian:  "indian_labels"
+    irish:   "irish_labels"
+    chinese: "chinese_labels"
+  positive_string: "misogyny"   # value that means label=1
+
+# ── Model ──────────────────────────────────────
+model:
+  siglip_name:  "google/siglip-so400m-patch14-384"
+  xlmr_name:    "xlm-roberta-base"
+  encoder_dim:  768             # output dim of both encoders
+  proj_dim:     768             # projection dim (keep same for simplicity)
+  fusion_heads: 8               # attention heads in cross-attention blocks
+  fusion_layers: 3              # number of transformer fusion blocks
+  shared_dim:   1024            # dim of shared representation after fusion
+  dropout:      0.1
+  max_img_tokens: 64            # cap patch tokens from SigLIP
+  max_txt_tokens: 64            # cap text tokens from XLM-R
+
+# ── Training stages ────────────────────────────
+training:
+  seed: 42
+  batch_size: 16
+  num_workers: 4
+  pin_memory: true
+
+  stage1:
+    epochs: 5
+    lr: 2.0e-4
+    freeze_encoders: true
+
+  stage2:
+    epochs: 15
+    lr: 5.0e-5
+    freeze_encoders: true
+
+  stage3:
+    epochs: 3
+    lr: 1.0e-5
+    freeze_encoders: false        # last 2 blocks unfrozen
+    unfreeze_last_n_blocks: 2
+
+  # Scheduler
+  warmup_ratio: 0.1              # fraction of steps used for linear warmup
+  weight_decay: 0.01
+  grad_clip: 1.0
+  mixed_precision: true          # torch.cuda.amp
+
+# ── Loss ───────────────────────────────────────
+loss:
+  # pos_weight computed automatically from data; set manually to override
+  # pos_weight_indian: 3.0
+  # pos_weight_irish:  3.0
+  # pos_weight_chinese: 3.0
+  culture_weights:               # relative weight of each culture's loss
+    indian:  1.0
+    irish:   1.0
+    chinese: 1.0
+
+# ── Logging / Checkpointing ────────────────────
+output:
+  checkpoint_dir: "./checkpoints"
+  log_every_n_steps: 50
+  eval_every_n_epochs: 1
+  save_best_metric: "avg_f1"    # metric to monitor for best checkpoint
