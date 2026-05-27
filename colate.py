@@ -1,120 +1,90 @@
 """
 data/collate.py
-
-Custom collate for DataLoader.
-Handles:
-  - Batching SigLIP pixel_values (already fixed size from processor)
-  - Batching XLM-R input_ids / attention_mask (padded to batch max len)
-  - Stacking per-culture label tensors
-  - Passing raw strings through (image_id, transcript)
+---------------
+Custom collator that:
+  - Runs SigLIP image processor on a batch of PIL images
+  - Runs XLM-R tokenizer on a batch of transcript strings
+  - Stacks labels and label_masks
+  - Returns everything as tensors ready for the model
 """
 
-from dataclasses import dataclass
-from typing import List, Dict
+from typing import Dict, List
 import torch
-from torch.nn.utils.rnn import pad_sequence
+from transformers import AutoProcessor, AutoTokenizer
 
 
-@dataclass
-class MisogynySample:
-    """Typed container for a single processed sample (post-encoder-processor)."""
-    image_id:        str
-    pixel_values:    torch.Tensor   # [3, H, W] — from SigLIP processor
-    input_ids:       torch.Tensor   # [seq_len]  — from XLM-R tokenizer
-    attention_mask:  torch.Tensor   # [seq_len]
-    labels:          Dict[str, torch.Tensor]   # {culture: scalar tensor}
-
-
-def collate_fn(samples: List[dict]) -> dict:
+class MemeCollator:
     """
-    Called by DataLoader with a list of raw __getitem__ dicts.
-
-    NOTE: pixel_values and input_ids are NOT processed here.
-    They are still PIL Images and raw strings at this point.
-    Preprocessing happens in the model's forward() via the stored processors,
-    OR you can move it here by passing the processors in — see below.
-
-    This version handles the case where the Dataset returns:
-      - image: torch.Tensor (if SigLIP processor applied in Dataset transform)
-      - input_ids / attention_mask: tensors (if XLM-R tokenizer applied in Dataset)
-
-    If you apply processors in the training loop instead, this still works —
-    just batch the raw strings and PIL images as lists.
+    Args:
+        siglip_processor : HuggingFace processor for SigLIP
+                           (handles image resize + normalisation)
+        xlmr_tokenizer   : HuggingFace tokenizer for XLM-R
+        max_img_tokens   : max number of patch tokens kept from SigLIP
+        max_txt_tokens   : max token length fed to XLM-R
+        device           : 'cpu' — move to GPU inside the training loop
     """
 
-    image_ids   = [s["image_id"]   for s in samples]
-    transcripts = [s["transcript"] for s in samples]
+    def __init__(
+        self,
+        siglip_processor,
+        xlmr_tokenizer,
+        max_img_tokens: int = 64,
+        max_txt_tokens: int = 64,
+    ):
+        self.siglip_proc  = siglip_processor
+        self.xlmr_tok     = xlmr_tokenizer
+        self.max_img_tokens = max_img_tokens
+        self.max_txt_tokens = max_txt_tokens
 
-    # ── Images ─────────────────────────────────────────────────────────────
-    # If transform was applied in Dataset, images are tensors → stack
-    # If not, images are PIL → keep as list (processor handles batching)
-    if isinstance(samples[0]["image"], torch.Tensor):
-        images = torch.stack([s["image"] for s in samples])   # [B, C, H, W]
-    else:
-        images = [s["image"] for s in samples]                # list of PIL
-
-    # ── Labels ─────────────────────────────────────────────────────────────
-    culture_keys = list(samples[0]["labels"].keys())
-    labels = {
-        culture: torch.stack([s["labels"][culture] for s in samples])
-        for culture in culture_keys
-    }   # each → [B]
-
-    return {
-        "image_ids":   image_ids,
-        "images":      images,
-        "transcripts": transcripts,
-        "labels":      labels,
-    }
-
-
-class ProcessorCollate:
-    """
-    Drop-in replacement for collate_fn that also runs the SigLIP image
-    processor and XLM-R tokenizer inside the DataLoader worker.
-
-    Usage:
-        collate = ProcessorCollate(siglip_processor, xlmr_tokenizer, cfg)
-        loader  = DataLoader(dataset, collate_fn=collate, ...)
-    """
-
-    def __init__(self, siglip_processor, xlmr_tokenizer, cfg: dict):
-        self.img_proc  = siglip_processor
-        self.txt_tok   = xlmr_tokenizer
-        self.max_img   = cfg["model"]["max_img_tokens"]
-        self.max_txt   = cfg["model"]["max_txt_tokens"]
-
-    def __call__(self, samples: List[dict]) -> dict:
-        image_ids   = [s["image_id"]   for s in samples]
+    def __call__(self, samples: List[Dict]) -> Dict[str, torch.Tensor]:
+        images      = [s["image"]      for s in samples]
         transcripts = [s["transcript"] for s in samples]
+        image_ids   = [s["image_id"]   for s in samples]
+        labels      = torch.stack([s["labels"]     for s in samples])   # [B, 3]
+        label_masks = torch.stack([s["label_mask"] for s in samples])   # [B, 3]
 
-        # ── SigLIP image processing ─────────────────────────────────────────
-        # Returns pixel_values: [B, 3, 384, 384]
-        img_inputs = self.img_proc(
-            images         = [s["image"] for s in samples],
-            return_tensors = "pt",
+        # ── image processing (SigLIP) ────────────────────────────────────────
+        # SigLIP processor returns pixel_values of shape [B, C, H, W]
+        img_inputs = self.siglip_proc(
+            images=images,
+            return_tensors="pt",
         )
+        pixel_values = img_inputs["pixel_values"]   # [B, 3, 384, 384]
 
-        # ── XLM-R tokenization ──────────────────────────────────────────────
-        txt_inputs = self.txt_tok(
+        # ── text tokenisation (XLM-R) ────────────────────────────────────────
+        txt_inputs = self.xlmr_tok(
             transcripts,
-            padding        = "longest",
-            truncation     = True,
-            max_length     = self.max_txt + 2,   # +2 for [CLS]/[SEP]
-            return_tensors = "pt",
+            padding=True,
+            truncation=True,
+            max_length=self.max_txt_tokens,
+            return_tensors="pt",
         )
-
-        # ── Labels ──────────────────────────────────────────────────────────
-        culture_keys = list(samples[0]["labels"].keys())
-        labels = {
-            culture: torch.stack([s["labels"][culture] for s in samples])
-            for culture in culture_keys
-        }
+        # input_ids: [B, N_txt], attention_mask: [B, N_txt]
 
         return {
-            "image_ids":      image_ids,
-            "pixel_values":   img_inputs["pixel_values"],     # [B, 3, H, W]
-            "input_ids":      txt_inputs["input_ids"],        # [B, T]
-            "attention_mask": txt_inputs["attention_mask"],   # [B, T]
-            "labels":         labels,                         # {culture: [B]}
+            "image_ids":           image_ids,                         # List[str]
+            "pixel_values":        pixel_values,                      # [B, 3, H, W]
+            "input_ids":           txt_inputs["input_ids"],           # [B, N_txt]
+            "attention_mask":      txt_inputs["attention_mask"],      # [B, N_txt]
+            "labels":              labels,                            # [B, 3]
+            "label_mask":          label_masks,                       # [B, 3]
         }
+
+
+def build_collator(cfg: dict):
+    """
+    Build a MemeCollator from config.
+    Loads the SigLIP processor and XLM-R tokenizer from HuggingFace.
+    """
+    model_cfg = cfg["model"]
+    data_cfg  = cfg["data"]
+
+    siglip_proc = AutoProcessor.from_pretrained(model_cfg["siglip_name"])
+    xlmr_tok    = AutoTokenizer.from_pretrained(model_cfg["xlmr_name"])
+
+    return MemeCollator(
+        siglip_processor=siglip_proc,
+        xlmr_tokenizer=xlmr_tok,
+        max_img_tokens=model_cfg["max_img_tokens"],
+        max_txt_tokens=model_cfg["max_txt_tokens"],
+    )
